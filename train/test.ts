@@ -82,4 +82,4 @@ function runManyTimes(times: number, rangeSize: number) {
   };
 }
 
-console.log(runManyTimes(1, 10));
+console.log(runManyTimes(100, 10000));
