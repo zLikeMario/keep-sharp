@@ -1,51 +1,68 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-interface IERC20 {
-    function transfer(address to, uint256 amount) external returns (bool);
-
-    function transferFrom(address from, address to, uint256 amount) external returns (bool);
-
-    function balanceOf(address account) external view returns (uint256);
-}
+// Version pinned so Remix's npm resolver can find the package; Foundry remaps the same prefix to
+// the local lib (see remappings.txt). Both toolchains compile this single source unchanged.
+import {VRFConsumerBaseV2Plus} from "@chainlink/contracts@1.3.0/src/v0.8/vrf/dev/VRFConsumerBaseV2Plus.sol";
+import {VRFV2PlusClient} from "@chainlink/contracts@1.3.0/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
 
 /// @title Train Fire Game (EVM)
 /// @notice A configurable on-chain game that mints ticket NFTs and settles rewards on random hits.
-contract TrainGame {
+/// @dev Randomness comes from Chainlink VRF v2.5. A play does NOT resolve in the same transaction:
+/// `play()` reserves a ticket and requests a random word; the coordinator later calls
+/// `fulfillRandomWords`, which assigns the number and checks for a hit. Only one randomness request
+/// is in flight at a time, so the game stays serialized (like the existing hit lock). This removes
+/// the same-transaction predictability/grinding that pure on-chain entropy is vulnerable to.
+contract TrainGame is VRFConsumerBaseV2Plus {
     uint256 private constant BPS = 10_000;
-    address public constant DEFAULT_USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+    bytes4 private constant ERC20_TRANSFER_SELECTOR = 0xa9059cbb;
+    bytes4 private constant ERC20_TRANSFER_FROM_SELECTOR = 0x23b872dd;
+    bytes4 private constant ERC20_BALANCE_OF_SELECTOR = 0x70a08231;
 
-    address public owner;
-    IERC20 public settlementToken;
+    // Fixed-point scale for the entry/withdraw curve coefficients (parts per million).
+    uint256 private constant CURVE_SCALE = 1_000_000;
+
+    // Reward fee (1%) taken from each reward payout and sent directly to a fixed recipient.
+    uint256 public constant REWARD_FEE_BPS = 100;
+    address public constant FEE_RECIPIENT = 0x888813D61Ad10161Be6480D88573dDf808558888;
+
+    // If a VRF request is never fulfilled, the initiator (or owner) can cancel it after this long and
+    // recover the staked funds, so a stuck oracle can never permanently freeze the game.
+    uint256 public constant REQUEST_TIMEOUT = 1 hours;
+
+    address public settlementToken;
 
     // Game configuration
-    uint256 public randomRange; // default: 10000 means [0, 10000]
-    uint256 public feeBps; // default: 10 = 0.1%
-    uint256 public baseEntryAmount; // default: 1 USDC (6 decimals)
-    uint256 public entryIncreaseBpsPerTicket; // phase-1 slow slope (bps per active ticket)
-    uint256 public entryBoostBpsPerTicket; // phase-2 boosted slope (bps per active ticket)
-    uint256 public entryCurveSpanTickets; // curve span used to derive 1/3 and 1/2 pivots
-    uint256 public entryCurveJumpBps; // jump at 1/3 pivot
-    uint256 public entryCurveMaxMultiplierBps; // asymptotic max multiplier in bps
-    uint256 public entryCurveFlattenFactor; // larger value => flatter tail after 1/2
-    uint256 public withdrawStartBps; // withdraw ratio for earliest position
-    uint256 public withdrawDecayBpsPerPosition; // decay per position
-    uint256 public withdrawMinBps; // floor for withdraw ratio
+    uint256 public randomRange; // b: random number count, generated values are [0, b - 1]
+    uint256 public sqrtRange; // s = floor(sqrt(b)), the collision-zone scale
+    uint256 public baseEntryAmount; // a: one whole default token in its smallest unit
     uint256 public lockDuration; // default: 5 minutes
+
+    // Upper bound on simultaneously active carriages. Bounds every list scan (hit search, settlement
+    // sums, range removal) so they can never exceed the block / VRF callback gas limit. 0 = unlimited.
+    uint256 public maxActiveTickets;
+
+    // When the owner closes the round no new plays are allowed and active players may reclaim stake.
+    bool public closed;
 
     // Accounting
     uint256 public totalPool;
-    uint256 public protocolFees;
+    // Sum of all unclaimed pendingRewards, so the owner sweep can never touch funds owed to players.
+    uint256 public totalPendingRewards;
 
     // Minimal NFT-like ticket data
     string public name = "Train Game Ticket";
     string public symbol = "TGT";
-    uint256 public totalSupply;
+    uint256 public totalSupply; // current occupied slot count
+    uint256 public nextTicketId; // monotonically increasing NFT id
 
     enum TicketStatus {
         None,
         Active,
-        Removed
+        Removed,
+        Withdrawn,
+        Invalid,
+        Pending // staked, awaiting its VRF number; not yet minted or in the active list
     }
 
     struct Ticket {
@@ -56,6 +73,7 @@ contract TrainGame {
         uint256 stakeAmount; // remaining principal still in pool
         bool principalWithdrawn;
         TicketStatus status;
+        uint256 secondGuessNumber; // the second-guess number when this ticket was voided by a miss
     }
 
     struct HitLock {
@@ -65,6 +83,9 @@ contract TrainGame {
         uint256 targetTicketId;
         address hitPlayer;
         bool secondGuessUsed;
+        bool secondGuessSucceeded;
+        uint256 secondGuessNumber;
+        uint256 rewardAmount;
     }
 
     HitLock public hitLock;
@@ -76,24 +97,71 @@ contract TrainGame {
     // Ticket storage
     mapping(uint256 => Ticket) public tickets;
     uint256[] public activeTicketIds;
-    mapping(uint256 => uint256[]) private randomToTicketIds;
+    // Number -> the single Active ticket currently holding it (0 = none). The game settles a hit the
+    // instant a second active ticket draws an existing number, so each number maps to at most one
+    // active ticket; this makes hit detection O(1) instead of scanning the whole active list.
+    mapping(uint256 => uint256) public activeTicketIdByNumber;
 
     // Withdraw ledgers
     mapping(address => uint256) public pendingRewards;
-    mapping(uint256 => bool) public pendingClaimTicket;
 
     // Reentrancy guard
     uint256 private _entered;
 
-    event Transfer(address indexed from, address indexed to, uint256 indexed tokenId);
+    // ------------------------------
+    // Chainlink VRF v2.5 configuration (owner-set after deploy, so nothing chain-specific is hardcoded)
+    // ------------------------------
+    bytes32 public vrfKeyHash; // gas lane
+    uint256 public vrfSubscriptionId; // 0 until configured
+    uint16 public vrfRequestConfirmations = 3;
+    // The callback's only O(active tickets) work is the settlement range-sum (~2.3k gas per carriage);
+    // hit detection itself is O(1). This limit must stay consistent with maxActiveTickets or a
+    // fulfillment could run out of gas. Defaults (callback 2.0M, cap 500) leave ample margin; raise
+    // both together for a longer train, keeping under the chain's max callback gas.
+    uint32 public vrfCallbackGasLimit = 2_000_000;
+    bool public vrfNativePayment; // pay the VRF fee in native coin (true) or LINK (false)
+
+    // ------------------------------
+    // Single in-flight randomness request
+    // ------------------------------
+    enum RequestKind {
+        None,
+        Play,
+        SecondGuess
+    }
+
+    uint256 public pendingRequestId; // 0 = no request in flight
+    RequestKind public pendingKind;
+    uint256 public pendingTicketId; // Play: the reserved ticket; SecondGuess: the hit ticket
+    address public pendingPlayer;
+    uint256 public pendingRequestedAt;
+
+    event Transfer(
+        address indexed from,
+        address indexed to,
+        uint256 indexed tokenId
+    );
+
+    event PlayRequested(
+        address indexed player,
+        uint256 indexed ticketId,
+        uint256 position,
+        uint256 amount,
+        uint256 requestId
+    );
+    event SecondGuessRequested(address indexed player, uint256 requestId);
+    event RequestCancelled(
+        uint256 indexed requestId,
+        uint8 kind,
+        address indexed player
+    );
 
     event Played(
         address indexed player,
         uint256 indexed ticketId,
         uint256 position,
         uint256 randomNumber,
-        uint256 amount,
-        uint256 fee
+        uint256 amount
     );
 
     event HitOccurred(
@@ -105,18 +173,48 @@ contract TrainGame {
         uint256 deadline
     );
 
-    event PrincipalWithdrawn(address indexed player, uint256 indexed ticketId, uint256 amount);
+    event PrincipalWithdrawn(
+        address indexed player,
+        uint256 indexed ticketId,
+        uint256 amount
+    );
     event RewardClaimed(address indexed player, uint256 amount);
     event LockReleased(uint256 indexed hitTicketId, bool timeoutMarked);
-    event SecondGuess(address indexed player, uint256 randomNumber, bool hit, uint256 targetTicketId);
-    event ConfigUpdated();
-    event EntryCurveUpdated();
-    event ProtocolFeesWithdrawn(address indexed to, uint256 amount);
-    event SettlementTokenUpdated(address indexed token, uint256 baseEntryAmount);
+    event SettlementFinalized(
+        uint256 indexed hitTicketId,
+        address indexed hitPlayer,
+        address indexed targetPlayer,
+        uint256 hitReward,
+        uint256 targetReward,
+        bool secondGuessSucceeded,
+        bool timedOut
+    );
+    event SecondGuess(
+        address indexed player,
+        uint256 randomNumber,
+        bool hit,
+        uint256 targetTicketId,
+        uint256 rewardAmount
+    );
+    event RewardFeePaid(address indexed recipient, uint256 amount);
+    event RoundClosed();
+    event StakeReclaimed(
+        address indexed player,
+        uint256 indexed ticketId,
+        uint256 amount
+    );
+    event VrfConfigUpdated(
+        bytes32 keyHash,
+        uint256 subscriptionId,
+        uint16 requestConfirmations,
+        uint32 callbackGasLimit,
+        bool nativePayment
+    );
+    event MaxActiveTicketsUpdated(uint256 maxActiveTickets);
+    event TokensSwept(address indexed token, address indexed to, uint256 amount);
 
     error NotOwner();
     error Locked();
-    error InvalidAmount();
     error InvalidConfig();
     error InvalidToken();
     error TicketNotActive();
@@ -128,11 +226,14 @@ contract TrainGame {
     error LockNotExpired();
     error AlreadySecondGuessed();
     error TokenTransferFailed();
-
-    modifier onlyOwner() {
-        if (msg.sender != owner) revert NotOwner();
-        _;
-    }
+    error GameClosed();
+    error GameNotClosed();
+    error RequestPending();
+    error NoPendingRequest();
+    error RequestNotStuck();
+    error VrfNotConfigured();
+    error RoundFull();
+    error NotAuthorized();
 
     modifier nonReentrant() {
         if (_entered == 1) revert();
@@ -141,99 +242,106 @@ contract TrainGame {
         _entered = 0;
     }
 
-    constructor() {
-        owner = msg.sender;
-        settlementToken = IERC20(DEFAULT_USDC);
+    constructor(
+        address _settlementToken,
+        uint256 _baseEntryAmount,
+        uint256 _randomRange,
+        uint256 _lockDuration,
+        address _vrfCoordinator
+    ) VRFConsumerBaseV2Plus(_vrfCoordinator) {
+        if (_baseEntryAmount == 0) revert InvalidConfig();
+        if (_randomRange < 2) revert InvalidConfig();
+        if (_lockDuration == 0) revert InvalidConfig();
 
-        randomRange = 10_000;
-        feeBps = 10;
-        baseEntryAmount = 1e6;
+        settlementToken = _settlementToken;
+        baseEntryAmount = _baseEntryAmount;
+        randomRange = _randomRange;
+        sqrtRange = _sqrt(_randomRange);
+        lockDuration = _lockDuration;
+        // Bounds the VRF callback's settlement range-sum; keep in step with vrfCallbackGasLimit.
+        // Comfortably above the birthday collision threshold even for large ranges (e.g. b=10000 ~125).
+        maxActiveTickets = 500;
+    }
 
-        // Entry curve: slow increase -> jump near 1/3 -> flatten near 1/2 and after.
-        entryIncreaseBpsPerTicket = 20;
-        entryBoostBpsPerTicket = 220;
-        entryCurveSpanTickets = 300;
-        entryCurveJumpBps = 2500;
-        entryCurveMaxMultiplierBps = 80_000;
-        entryCurveFlattenFactor = 120;
-
-        // Withdraw ratio curve by position index
-        withdrawStartBps = 9000;
-        withdrawDecayBpsPerPosition = 10;
-        withdrawMinBps = 1000;
-
-        lockDuration = 5 minutes;
+    /// @dev Integer square root (Babylonian). Used for the collision-zone scale s = floor(sqrt(b)).
+    function _sqrt(uint256 n) internal pure returns (uint256) {
+        if (n == 0) return 0;
+        uint256 x = n;
+        uint256 y = (x + 1) / 2;
+        while (y < x) {
+            x = y;
+            y = (x + n / x) / 2;
+        }
+        return x;
     }
 
     // ------------------------------
     // Owner configuration
     // ------------------------------
 
-    function setSettlementToken(address token, uint256 _baseEntryAmount) external onlyOwner {
-        if (token == address(0)) revert InvalidToken();
-        if (_baseEntryAmount == 0) revert InvalidConfig();
-
-        settlementToken = IERC20(token);
-        baseEntryAmount = _baseEntryAmount;
-
-        emit SettlementTokenUpdated(token, _baseEntryAmount);
-    }
-
-    function setConfig(
-        uint256 _randomRange,
-        uint256 _feeBps,
-        uint256 _baseEntryAmount,
-        uint256 _entryIncreaseBpsPerTicket,
-        uint256 _withdrawStartBps,
-        uint256 _withdrawDecayBpsPerPosition,
-        uint256 _withdrawMinBps,
-        uint256 _lockDuration
+    /// @notice Configure the Chainlink VRF subscription. Must be set (subscriptionId != 0) before any
+    /// play can draw a number. The subscription is created off-chain, this contract added as consumer.
+    function setVrfConfig(
+        bytes32 keyHash,
+        uint256 subscriptionId,
+        uint16 requestConfirmations,
+        uint32 callbackGasLimit,
+        bool nativePayment
     ) external onlyOwner {
-        if (_randomRange < 2) revert InvalidConfig();
-        if (_feeBps > 500) revert InvalidConfig();
-        if (_baseEntryAmount == 0) revert InvalidConfig();
-        if (_withdrawStartBps > BPS || _withdrawMinBps > _withdrawStartBps) revert InvalidConfig();
-        if (_lockDuration == 0) revert InvalidConfig();
-
-        randomRange = _randomRange;
-        feeBps = _feeBps;
-        baseEntryAmount = _baseEntryAmount;
-        entryIncreaseBpsPerTicket = _entryIncreaseBpsPerTicket;
-        withdrawStartBps = _withdrawStartBps;
-        withdrawDecayBpsPerPosition = _withdrawDecayBpsPerPosition;
-        withdrawMinBps = _withdrawMinBps;
-        lockDuration = _lockDuration;
-
-        emit ConfigUpdated();
+        if (requestConfirmations == 0 || callbackGasLimit == 0) revert InvalidConfig();
+        vrfKeyHash = keyHash;
+        vrfSubscriptionId = subscriptionId;
+        vrfRequestConfirmations = requestConfirmations;
+        vrfCallbackGasLimit = callbackGasLimit;
+        vrfNativePayment = nativePayment;
+        emit VrfConfigUpdated(
+            keyHash,
+            subscriptionId,
+            requestConfirmations,
+            callbackGasLimit,
+            nativePayment
+        );
     }
 
-    function setEntryCurveConfig(
-        uint256 _entryIncreaseBpsPerTicket,
-        uint256 _entryBoostBpsPerTicket,
-        uint256 _entryCurveSpanTickets,
-        uint256 _entryCurveJumpBps,
-        uint256 _entryCurveMaxMultiplierBps,
-        uint256 _entryCurveFlattenFactor
-    ) external onlyOwner {
-        if (_entryCurveSpanTickets < 6) revert InvalidConfig();
-        if (_entryCurveMaxMultiplierBps <= BPS) revert InvalidConfig();
-        if (_entryCurveFlattenFactor == 0) revert InvalidConfig();
-
-        entryIncreaseBpsPerTicket = _entryIncreaseBpsPerTicket;
-        entryBoostBpsPerTicket = _entryBoostBpsPerTicket;
-        entryCurveSpanTickets = _entryCurveSpanTickets;
-        entryCurveJumpBps = _entryCurveJumpBps;
-        entryCurveMaxMultiplierBps = _entryCurveMaxMultiplierBps;
-        entryCurveFlattenFactor = _entryCurveFlattenFactor;
-
-        emit EntryCurveUpdated();
+    /// @notice Adjust the active-carriage cap (bounds all list scans). 0 disables the cap.
+    function setMaxActiveTickets(uint256 newMax) external onlyOwner {
+        maxActiveTickets = newMax;
+        emit MaxActiveTicketsUpdated(newMax);
     }
 
-    function withdrawProtocolFees(address to, uint256 amount) external onlyOwner nonReentrant {
-        if (amount > protocolFees) revert InvalidAmount();
-        protocolFees -= amount;
-        _safeTokenTransfer(to, amount);
-        emit ProtocolFeesWithdrawn(to, amount);
+    /// @notice Owner ends the round: no new plays are allowed afterwards, and active players can
+    /// reclaim their original participation amount via reclaimStake.
+    function closeGame() external onlyOwner nonReentrant {
+        if (pendingRequestId != 0) revert RequestPending();
+        _autoReleaseLockIfExpired();
+        if (hitLock.active) revert Locked();
+        if (closed) revert GameClosed();
+        closed = true;
+        emit RoundClosed();
+    }
+
+    /// @notice After the round is closed, an active ticket holder reclaims their full participation
+    /// amount (no fee). Tickets that withdrew midway, lost a second guess, or were voided/settled
+    /// are not Active and therefore cannot reclaim.
+    function reclaimStake(uint256 ticketId) external nonReentrant {
+        if (!closed) revert GameNotClosed();
+
+        Ticket storage t = tickets[ticketId];
+        if (t.status != TicketStatus.Active) revert TicketNotActive();
+        if (t.player != msg.sender) revert NotTicketOwner();
+
+        uint256 amount = t.stakeAmount;
+        if (amount == 0) revert NothingToClaim();
+
+        t.stakeAmount = 0;
+        t.principalWithdrawn = true;
+        t.status = TicketStatus.Withdrawn;
+        _clearNumberIndex(ticketId, t.randomNumber);
+        totalPool -= amount;
+        _burn(ticketId);
+
+        _safeTokenTransfer(msg.sender, amount);
+        emit StakeReclaimed(msg.sender, ticketId, amount);
     }
 
     // ------------------------------
@@ -256,288 +364,632 @@ contract TrainGame {
     }
 
     function getCurrentEntryAmount() public view returns (uint256) {
-        uint256 activeCount = activeTicketIds.length;
-
-        uint256 pivotOne = entryCurveSpanTickets / 3;
-        if (pivotOne == 0) pivotOne = 1;
-
-        uint256 pivotTwo = entryCurveSpanTickets / 2;
-        if (pivotTwo <= pivotOne) pivotTwo = pivotOne + 1;
-
-        uint256 multiplierBps;
-        if (activeCount <= pivotOne) {
-            multiplierBps = BPS + activeCount * entryIncreaseBpsPerTicket;
-        } else if (activeCount <= pivotTwo) {
-            uint256 atPivotOne = BPS + pivotOne * entryIncreaseBpsPerTicket;
-            uint256 phaseTwoCount = activeCount - pivotOne;
-            multiplierBps = atPivotOne + entryCurveJumpBps + phaseTwoCount * entryBoostBpsPerTicket;
-        } else {
-            uint256 atPivotOne = BPS + pivotOne * entryIncreaseBpsPerTicket;
-            uint256 atPivotTwo =
-                atPivotOne +
-                entryCurveJumpBps +
-                (pivotTwo - pivotOne) * entryBoostBpsPerTicket;
-
-            if (entryCurveMaxMultiplierBps <= atPivotTwo) {
-                multiplierBps = atPivotTwo;
-            } else {
-                uint256 x = activeCount - pivotTwo;
-                uint256 tailRange = entryCurveMaxMultiplierBps - atPivotTwo;
-                uint256 tailGain = (tailRange * x) / (x + entryCurveFlattenFactor);
-                multiplierBps = atPivotTwo + tailGain;
-            }
-        }
-
-        return (baseEntryAmount * multiplierBps) / BPS;
+        return getEntryAmount(totalSupply + 1);
     }
 
-    function getWithdrawRatioBps(uint256 position) public view returns (uint256) {
-        if (position == 0) return withdrawMinBps;
-        uint256 decay = (position - 1) * withdrawDecayBpsPerPosition;
-        if (decay >= withdrawStartBps) return withdrawMinBps;
+    /// @notice Entry curve, derived from the birthday/collision economics.
+    /// @dev The expected value of a seat is bathtub-shaped in the participation index x:
+    /// front seats survive and win as targets, the cheapest seats sit at the collision
+    /// zone x ~ sqrt(b), and rare deep seats are valuable again. The price multiplier is
+    ///     phi(x) = clamp( 0.40 * (x^2 / b) + 0.57 * (s / x) - 0.40 , 0.40 , 6.0 )
+    /// with a gentle early-advantage / late-disadvantage tilt
+    ///     tilt(x) = 1 + 0.12 * (x - s) / (x + s)
+    /// where s = floor(sqrt(b)). entry(x) = a * phi(x) * tilt(x). Tuned so the bulk's expected
+    /// value runs ~1.05 early -> ~0.9 mid -> ~0.8 late (declining, FOMO), the cheapest tickets
+    /// sit at x ~ sqrt(b), the front jackpot is bounded, and late stakes grow large (up to ~6x).
+    /// All math is integer fixed-point at CURVE_SCALE (1e6); divisions round down.
+    function getEntryAmount(
+        uint256 participantIndex
+    ) public view returns (uint256) {
+        if (participantIndex == 0) revert InvalidConfig();
+        return (baseEntryAmount * _entryMultiplier(participantIndex)) / CURVE_SCALE;
+    }
 
-        uint256 ratio = withdrawStartBps - decay;
-        if (ratio < withdrawMinBps) return withdrawMinBps;
-        return ratio;
+    /// @dev Returns the entry price multiplier phi(x) * tilt(x), scaled by CURVE_SCALE.
+    function _entryMultiplier(uint256 x) internal view returns (uint256) {
+        uint256 b = randomRange;
+        uint256 s = sqrtRange;
+
+        // phi(x) = 0.40*x^2/b + 0.57*s/x - 0.40, clamped to [0.40, 6.0].
+        uint256 positive = (40 * x * x * CURVE_SCALE) / (100 * b) +
+            (57 * s * CURVE_SCALE) / (100 * x);
+        uint256 offset = (40 * CURVE_SCALE) / 100;
+        uint256 phi = positive > offset ? positive - offset : 0;
+
+        uint256 lower = (40 * CURVE_SCALE) / 100;
+        uint256 upper = (600 * CURVE_SCALE) / 100;
+        if (phi < lower) phi = lower;
+        if (phi > upper) phi = upper;
+
+        // tilt(x) = 1 + 0.12 * (x - s) / (x + s); bounded to (0.88, 1.12).
+        uint256 span = (12 * CURVE_SCALE) / 100;
+        uint256 tilt;
+        if (x >= s) {
+            tilt = CURVE_SCALE + (span * (x - s)) / (x + s);
+        } else {
+            tilt = CURVE_SCALE - (span * (s - x)) / (x + s);
+        }
+
+        return (phi * tilt) / CURVE_SCALE;
+    }
+
+    /// @notice Withdraw curve: a fraction of the seat's entry price that shrinks as the seat
+    /// gets "hotter" (closer to / inside the collision zone), so a player cannot dodge an
+    /// imminent middle-loss by exiting.
+    /// @dev withdraw(x) = entry(x) * (0.30 + 0.60 * R(x)), where R(x) = 2b / (2b + x^2) is a
+    /// rational survival proxy (~1 at the cold front, ~0 deep). Always < entry(x).
+    function getWithdrawAmount(
+        uint256 participantIndex
+    ) public view returns (uint256) {
+        if (participantIndex == 0) revert InvalidConfig();
+
+        uint256 twoB = 2 * randomRange;
+        uint256 xSquared = participantIndex * participantIndex;
+        uint256 factor = (30 * CURVE_SCALE) /
+            100 +
+            ((60 * CURVE_SCALE) / 100) *
+            twoB /
+            (twoB + xSquared);
+
+        return (getEntryAmount(participantIndex) * factor) / CURVE_SCALE;
+    }
+
+    function getTicketWithdrawAmount(
+        uint256 ticketId
+    ) public view returns (uint256) {
+        Ticket storage t = tickets[ticketId];
+        if (
+            t.id == 0 || t.principalWithdrawn || t.status != TicketStatus.Active
+        ) return 0;
+
+        uint256 amount = getWithdrawAmount(t.position);
+        return amount > t.stakeAmount ? t.stakeAmount : amount;
     }
 
     // ------------------------------
     // Game flow
     // ------------------------------
 
+    /// @notice Stake and request a random number. The ticket is reserved now; its number is assigned
+    /// asynchronously in `fulfillRandomWords`. While a request is in flight the game is frozen.
     function play() external nonReentrant {
+        if (pendingRequestId != 0) revert RequestPending();
+        if (closed) revert GameClosed();
         _autoReleaseLockIfExpired();
         if (hitLock.active) revert Locked();
+        if (vrfSubscriptionId == 0) revert VrfNotConfigured();
+        if (maxActiveTickets != 0 && activeTicketIds.length >= maxActiveTickets) {
+            revert RoundFull();
+        }
 
         uint256 requiredAmount = getCurrentEntryAmount();
 
-        uint256 ticketId = ++totalSupply;
-        uint256 position = ticketId;
-        uint256 randomNumber = _generateRandom(msg.sender, ticketId) % randomRange;
+        uint256 ticketId = ++nextTicketId;
+        uint256 position = totalSupply + 1;
+        totalSupply = position;
 
+        // Balance-delta accounting: credit exactly what arrived, so fee-on-transfer tokens cannot
+        // desync totalPool from the real balance (which would otherwise strand later claimers).
+        uint256 balanceBefore = _tokenBalance();
         _safeTokenTransferFrom(msg.sender, address(this), requiredAmount);
-
-        uint256 fee = (requiredAmount * feeBps) / BPS;
-        uint256 net = requiredAmount - fee;
-
-        protocolFees += fee;
-        totalPool += net;
+        uint256 received = _tokenBalance() - balanceBefore;
+        totalPool += received;
 
         Ticket storage t = tickets[ticketId];
         t.id = ticketId;
         t.player = msg.sender;
         t.position = position;
-        t.randomNumber = randomNumber;
-        t.stakeAmount = net;
+        t.stakeAmount = received;
         t.principalWithdrawn = false;
-        t.status = TicketStatus.Active;
+        t.status = TicketStatus.Pending;
 
-        _mint(msg.sender, ticketId);
-        activeTicketIds.push(ticketId);
-        randomToTicketIds[randomNumber].push(ticketId);
+        uint256 requestId = _requestRandomWord();
+        pendingRequestId = requestId;
+        pendingKind = RequestKind.Play;
+        pendingTicketId = ticketId;
+        pendingPlayer = msg.sender;
+        pendingRequestedAt = block.timestamp;
 
-        emit Played(msg.sender, ticketId, position, randomNumber, requiredAmount, fee);
-
-        uint256 targetTicketId = _findAnotherActiveTicketByRandom(randomNumber, ticketId);
-        if (targetTicketId != 0) {
-            _handleHit(ticketId, targetTicketId);
-        }
+        emit PlayRequested(msg.sender, ticketId, position, received, requestId);
     }
 
     function withdrawPrincipal(uint256 ticketId) external nonReentrant {
+        if (pendingRequestId != 0) revert RequestPending();
+        if (closed) revert GameClosed();
         _autoReleaseLockIfExpired();
+        if (hitLock.active) revert Locked();
 
         Ticket storage t = tickets[ticketId];
         if (t.status != TicketStatus.Active) revert TicketNotActive();
         if (t.player != msg.sender) revert NotTicketOwner();
         if (t.principalWithdrawn) revert AlreadyWithdrawn();
 
-        uint256 ratioBps = getWithdrawRatioBps(t.position);
-        uint256 amount = (t.stakeAmount * ratioBps) / BPS;
+        uint256 amount = getTicketWithdrawAmount(ticketId);
         if (amount == 0) revert NothingToClaim();
 
         t.principalWithdrawn = true;
+        t.status = TicketStatus.Withdrawn;
+        _clearNumberIndex(ticketId, t.randomNumber);
         t.stakeAmount -= amount;
         totalPool -= amount;
+        // Free the carriage slot: the next entry reuses this position/price. The residual stake
+        // stays in the list (and pool) as a ghost, ordered by id between its neighbours, so a
+        // later collision spanning it still includes the leftover amount in settlement.
+        totalSupply -= 1;
+        _burn(ticketId);
 
         _safeTokenTransfer(msg.sender, amount);
         emit PrincipalWithdrawn(msg.sender, ticketId, amount);
     }
 
     function claimReward() external nonReentrant {
+        if (pendingRequestId != 0) revert RequestPending();
         _autoReleaseLockIfExpired();
-        uint256 amount = pendingRewards[msg.sender];
+        if (hitLock.active) revert Locked();
+
+        uint256 amount = _consumeReward(msg.sender);
         if (amount == 0) revert NothingToClaim();
 
-        pendingRewards[msg.sender] = 0;
-        totalPool -= amount;
-
-        _safeTokenTransfer(msg.sender, amount);
+        _payReward(msg.sender, amount);
         emit RewardClaimed(msg.sender, amount);
     }
 
-    /// @notice During lock window, hit player can choose immediate extraction and unlock game.
+    /// @dev Pays a reward, skimming REWARD_FEE_BPS (1%) directly to FEE_RECIPIENT. The full gross
+    /// amount leaves the pool; the player receives the net and FEE_RECIPIENT the fee.
+    function _payReward(address to, uint256 amount) internal {
+        totalPool -= amount;
+        uint256 fee = (amount * REWARD_FEE_BPS) / BPS;
+        uint256 net = amount - fee;
+        if (fee > 0) {
+            _safeTokenTransfer(FEE_RECIPIENT, fee);
+            emit RewardFeePaid(FEE_RECIPIENT, fee);
+        }
+        if (net > 0) _safeTokenTransfer(to, net);
+    }
+
+    /// @notice During lock window, the hit player can claim immediately and unlock the game.
+    /// @dev The first被命中 player's half is allocated to pendingRewards so they can claim
+    /// it independently later. A successful second guess is split with the FIRST target as well;
+    /// the second-guess target only decided whether the guess succeeded.
     function hitPlayerClaimAndUnlock() external nonReentrant {
+        if (pendingRequestId != 0) revert RequestPending();
         if (!hitLock.active) revert LockNotActive();
         if (msg.sender != hitLock.hitPlayer) revert NotHitPlayer();
+        if (block.timestamp >= hitLock.deadline) revert LockNotExpired();
 
-        uint256 amount = pendingRewards[msg.sender];
+        uint256 hitTicketId = hitLock.hitTicketId;
+        bool secondGuessSucceeded = hitLock.secondGuessSucceeded;
+
+        (
+            address hitPlayer,
+            uint256 hitReward,
+            address targetPlayer,
+            uint256 targetReward
+        ) = _splitAndRemoveSettlement();
+
+        _creditReward(targetPlayer, targetReward);
+
+        // The hit player's own previously-pending rewards plus this hit's share, paid out now.
+        uint256 amount = _consumeReward(hitPlayer) + hitReward;
         if (amount == 0) revert NothingToClaim();
-
-        pendingRewards[msg.sender] = 0;
-        totalPool -= amount;
-        _safeTokenTransfer(msg.sender, amount);
 
         _unlock(false);
-        emit RewardClaimed(msg.sender, amount);
+        emit SettlementFinalized(
+            hitTicketId,
+            hitPlayer,
+            targetPlayer,
+            hitReward,
+            targetReward,
+            secondGuessSucceeded,
+            false
+        );
+        _payReward(hitPlayer, amount);
+        emit RewardClaimed(hitPlayer, amount);
     }
 
-    /// @notice Hit player can perform one second guess during lock.
-    /// If hit succeeds, all current active stakes are split 50/50 between hit player and target player.
+    /// @notice Hit player requests one second-guess draw during the lock. The outcome is resolved
+    /// asynchronously in `fulfillRandomWords`.
     function secondGuess() external nonReentrant {
+        if (pendingRequestId != 0) revert RequestPending();
         if (!hitLock.active) revert LockNotActive();
         if (msg.sender != hitLock.hitPlayer) revert NotHitPlayer();
-        if (block.timestamp > hitLock.deadline) revert LockNotExpired();
+        if (block.timestamp >= hitLock.deadline) revert LockNotExpired();
         if (hitLock.secondGuessUsed) revert AlreadySecondGuessed();
 
-        hitLock.secondGuessUsed = true;
+        uint256 requestId = _requestRandomWord();
+        pendingRequestId = requestId;
+        pendingKind = RequestKind.SecondGuess;
+        pendingTicketId = hitLock.hitTicketId;
+        pendingPlayer = msg.sender;
+        pendingRequestedAt = block.timestamp;
 
-        uint256 randomNumber = _generateRandom(msg.sender, totalSupply + 1) % randomRange;
-        uint256 targetTicketId = _findAnyActiveTicketByRandom(randomNumber);
-
-        bool success = targetTicketId != 0;
-        if (success) {
-            address targetPlayer = tickets[targetTicketId].player;
-            uint256 activeStakePool = _drainAllActiveStakes();
-
-            uint256 half = activeStakePool / 2;
-            pendingRewards[msg.sender] += half;
-            pendingRewards[targetPlayer] += activeStakePool - half;
-
-            _removeTicket(targetTicketId);
-        }
-
-        emit SecondGuess(msg.sender, randomNumber, success, targetTicketId);
-        _unlock(false);
+        emit SecondGuessRequested(msg.sender, requestId);
     }
 
-    /// @notice Anyone can release lock after timeout; system only marks hit ticket as pending claim and unlocks.
+    /// @notice Only the hit player can explicitly release an expired lock.
+    /// Other players can resume normal operations after timeout; those operations auto-release it.
     function releaseLockAfterTimeout() external {
+        if (pendingRequestId != 0) revert RequestPending();
         if (!hitLock.active) revert LockNotActive();
+        if (msg.sender != hitLock.hitPlayer) revert NotHitPlayer();
         if (block.timestamp < hitLock.deadline) revert LockNotExpired();
-        _unlock(true);
+        _expireHitLock();
+    }
+
+    /// @notice Recover the stake from a VRF request that the coordinator never fulfilled. Callable by
+    /// the initiating player or the owner once REQUEST_TIMEOUT has elapsed, so a stuck oracle cannot
+    /// permanently freeze the game or trap funds. A late fulfillment afterwards is ignored.
+    function cancelStuckRequest() external nonReentrant {
+        uint256 requestId = pendingRequestId;
+        if (requestId == 0) revert NoPendingRequest();
+        if (block.timestamp < pendingRequestedAt + REQUEST_TIMEOUT) revert RequestNotStuck();
+        if (msg.sender != pendingPlayer && msg.sender != owner()) revert NotAuthorized();
+
+        RequestKind kind = pendingKind;
+        uint256 ticketId = pendingTicketId;
+        address player = pendingPlayer;
+        _clearPending();
+
+        if (kind == RequestKind.Play) {
+            Ticket storage t = tickets[ticketId];
+            if (t.status == TicketStatus.Pending) {
+                uint256 refund = t.stakeAmount;
+                t.stakeAmount = 0;
+                t.status = TicketStatus.Removed;
+                totalPool -= refund;
+                totalSupply -= 1;
+                if (refund > 0) _safeTokenTransfer(player, refund);
+            }
+        }
+        // For a stuck second guess there is nothing to refund; clearing the request lets the lock
+        // expire and settle the original hit normally.
+        emit RequestCancelled(requestId, uint8(kind), player);
+    }
+
+    // ------------------------------
+    // Chainlink VRF
+    // ------------------------------
+
+    function _requestRandomWord() internal returns (uint256) {
+        return
+            s_vrfCoordinator.requestRandomWords(
+                VRFV2PlusClient.RandomWordsRequest({
+                    keyHash: vrfKeyHash,
+                    subId: vrfSubscriptionId,
+                    requestConfirmations: vrfRequestConfirmations,
+                    callbackGasLimit: vrfCallbackGasLimit,
+                    numWords: 1,
+                    extraArgs: VRFV2PlusClient._argsToBytes(
+                        VRFV2PlusClient.ExtraArgsV1({nativePayment: vrfNativePayment})
+                    )
+                })
+            );
+    }
+
+    /// @dev VRF callback. MUST NOT revert: it does only storage writes and emits (no token moves, no
+    /// external calls), and ignores any request id that is not the one currently in flight.
+    function fulfillRandomWords(
+        uint256 requestId,
+        uint256[] calldata randomWords
+    ) internal override {
+        if (requestId != pendingRequestId) return;
+
+        RequestKind kind = pendingKind;
+        uint256 ticketId = pendingTicketId;
+        uint256 randomNumber = randomWords[0] % randomRange;
+
+        // Clear the in-flight request first so the game unfreezes and this can't be double-processed.
+        _clearPending();
+
+        if (kind == RequestKind.Play) {
+            _finalizePlay(ticketId, randomNumber);
+        } else if (kind == RequestKind.SecondGuess) {
+            _finalizeSecondGuess(randomNumber);
+        }
+    }
+
+    function _finalizePlay(uint256 ticketId, uint256 randomNumber) internal {
+        Ticket storage t = tickets[ticketId];
+        // Defensive: only finalize a ticket still awaiting its number.
+        if (t.status != TicketStatus.Pending) return;
+
+        t.randomNumber = randomNumber;
+        t.status = TicketStatus.Active;
+
+        _mint(t.player, ticketId);
+        activeTicketIds.push(ticketId);
+
+        emit Played(t.player, ticketId, t.position, randomNumber, t.stakeAmount);
+
+        uint256 targetTicketId = activeTicketIdByNumber[randomNumber];
+        if (targetTicketId != 0) {
+            // A second active ticket drew an existing number -> immediate hit. Neither end is left
+            // registered as the number's holder; the settlement (claim/expire) clears the existing
+            // entry when it removes the range.
+            _handleHit(ticketId, targetTicketId);
+        } else {
+            activeTicketIdByNumber[randomNumber] = ticketId;
+        }
+    }
+
+    function _finalizeSecondGuess(uint256 randomNumber) internal {
+        // The lock could have settled while the request was outstanding; only resolve if still live.
+        if (!hitLock.active || hitLock.secondGuessUsed) return;
+        uint256 targetTicketId = _findAnyActiveTicketByRandom(randomNumber);
+        _resolveSecondGuess(randomNumber, targetTicketId);
+    }
+
+    function _clearPending() internal {
+        pendingRequestId = 0;
+        pendingKind = RequestKind.None;
+        pendingTicketId = 0;
+        pendingPlayer = address(0);
+        pendingRequestedAt = 0;
     }
 
     // ------------------------------
     // Internal settlement
     // ------------------------------
 
+    function _creditReward(address to, uint256 amount) internal {
+        if (amount == 0) return;
+        pendingRewards[to] += amount;
+        totalPendingRewards += amount;
+    }
+
+    function _consumeReward(address from) internal returns (uint256 amount) {
+        amount = pendingRewards[from];
+        if (amount > 0) {
+            pendingRewards[from] = 0;
+            totalPendingRewards -= amount;
+        }
+    }
+
+    function _resolveSecondGuess(
+        uint256 randomNumber,
+        uint256 targetTicketId
+    ) internal {
+        hitLock.secondGuessUsed = true;
+        hitLock.secondGuessNumber = randomNumber;
+        bool success = targetTicketId != 0;
+        if (success) {
+            hitLock.secondGuessSucceeded = true;
+            // Keep hitLock.targetTicketId as the FIRST被命中 ticket: the reward is split
+            // with the first target. The second-guess target only validated the guess.
+            hitLock.rewardAmount = _getOccupiedStakePool();
+            hitLock.deadline = block.timestamp + lockDuration;
+        }
+
+        emit SecondGuess(
+            hitLock.hitPlayer,
+            randomNumber,
+            success,
+            targetTicketId,
+            success ? hitLock.rewardAmount : 0
+        );
+
+        if (!success) {
+            _invalidateHitTicket();
+            _unlock(false);
+        }
+    }
+
     function _handleHit(uint256 hitTicketId, uint256 targetTicketId) internal {
         Ticket storage hitT = tickets[hitTicketId];
         Ticket storage targetT = tickets[targetTicketId];
-
-        uint256 left = hitT.position < targetT.position ? hitT.position : targetT.position;
-        uint256 right = hitT.position < targetT.position ? targetT.position : hitT.position;
-
-        uint256 middleAmount;
-        for (uint256 i = 0; i < activeTicketIds.length; i++) {
-            Ticket storage t = tickets[activeTicketIds[i]];
-            if (t.status == TicketStatus.Active && t.position >= left && t.position <= right) {
-                middleAmount += t.stakeAmount;
-                t.stakeAmount = 0;
-            }
-        }
-
-        uint256 half = middleAmount / 2;
-        pendingRewards[hitT.player] += half;
-        pendingRewards[targetT.player] += middleAmount - half;
-
-        _removeTicket(hitTicketId);
-        _removeTicket(targetTicketId);
-
+        // Ordering keys off the monotonic ticket id, not position: withdrawn slots are reused
+        // for entry pricing, so positions are no longer unique. The id range still spans every
+        // carriage (including withdrawn residual ghosts) between the two ends, inclusive.
+        uint256 middleAmount = _getTicketRangeStake(hitTicketId, targetTicketId);
+        // Keep range tickets queryable while locked; claiming performs removal.
         hitLock = HitLock({
             active: true,
             deadline: block.timestamp + lockDuration,
             hitTicketId: hitTicketId,
             targetTicketId: targetTicketId,
             hitPlayer: hitT.player,
-            secondGuessUsed: false
+            secondGuessUsed: false,
+            secondGuessSucceeded: false,
+            secondGuessNumber: 0,
+            rewardAmount: middleAmount
         });
 
-        emit HitOccurred(hitTicketId, targetTicketId, hitT.player, targetT.player, middleAmount, hitLock.deadline);
+        emit HitOccurred(
+            hitTicketId,
+            targetTicketId,
+            hitT.player,
+            targetT.player,
+            middleAmount,
+            hitLock.deadline
+        );
     }
 
     function _unlock(bool timeoutMarked) internal {
         uint256 hitTicketId = hitLock.hitTicketId;
-        if (timeoutMarked) {
-            pendingClaimTicket[hitTicketId] = true;
-        }
         delete hitLock;
         emit LockReleased(hitTicketId, timeoutMarked);
     }
 
     function _autoReleaseLockIfExpired() internal {
         if (hitLock.active && block.timestamp >= hitLock.deadline) {
-            _unlock(true);
+            _expireHitLock();
         }
     }
 
-    function _removeTicket(uint256 ticketId) internal {
-        Ticket storage t = tickets[ticketId];
-        if (t.status != TicketStatus.Active) return;
-        t.status = TicketStatus.Removed;
-        t.stakeAmount = 0;
+    /// @notice Timeout path: the hit player took no action before the deadline.
+    /// @dev The settlement is still finalized so BOTH the hit player and the first被命中
+    /// player keep their share as independently-claimable pendingRewards, and the命中区间
+    /// tickets are removed from the active list (so they leave the pool and the table).
+    function _expireHitLock() internal {
+        uint256 hitTicketId = hitLock.hitTicketId;
+        bool secondGuessSucceeded = hitLock.secondGuessSucceeded;
 
-        // Remove from activeTicketIds (swap & pop)
+        (
+            address hitPlayer,
+            uint256 hitReward,
+            address targetPlayer,
+            uint256 targetReward
+        ) = _splitAndRemoveSettlement();
+
+        _creditReward(hitPlayer, hitReward);
+        _creditReward(targetPlayer, targetReward);
+
+        _unlock(true);
+        emit SettlementFinalized(
+            hitTicketId,
+            hitPlayer,
+            targetPlayer,
+            hitReward,
+            targetReward,
+            secondGuessSucceeded,
+            true
+        );
+    }
+
+    /// @dev Splits the locked reward between the hit player and the FIRST被命中 player,
+    /// then removes the settled tickets and reduces supply. Does not move tokens or unlock.
+    /// A self-hit (hit player owns the target ticket) keeps the whole reward.
+    function _splitAndRemoveSettlement()
+        internal
+        returns (
+            address hitPlayer,
+            uint256 hitReward,
+            address targetPlayer,
+            uint256 targetReward
+        )
+    {
+        hitPlayer = hitLock.hitPlayer;
+        Ticket storage targetTicket = tickets[hitLock.targetTicketId];
+        targetPlayer = targetTicket.player;
+        uint256 reward = hitLock.rewardAmount;
+
+        if (targetPlayer == hitPlayer) {
+            hitReward = reward;
+            targetReward = 0;
+        } else {
+            hitReward = reward / 2;
+            targetReward = reward - hitReward;
+        }
+
+        if (hitLock.secondGuessSucceeded) {
+            _removeAllOccupiedTickets();
+        } else {
+            uint256 hitId = hitLock.hitTicketId;
+            uint256 targetId = hitLock.targetTicketId;
+            uint256 left = hitId < targetId ? hitId : targetId;
+            uint256 right = hitId < targetId ? targetId : hitId;
+            (, uint256 removedSlotCount) = _removeTicketRange(left, right);
+            totalSupply -= removedSlotCount;
+        }
+    }
+
+    function _invalidateHitTicket() internal {
+        Ticket storage hitTicket = tickets[hitLock.hitTicketId];
+        if (hitTicket.status == TicketStatus.Active) {
+            hitTicket.status = TicketStatus.Invalid;
+            _clearNumberIndex(hitLock.hitTicketId, hitTicket.randomNumber);
+            // Record the missed second-guess number so the table can show it on the voided ticket.
+            hitTicket.secondGuessNumber = hitLock.secondGuessNumber;
+            _burn(hitLock.hitTicketId);
+        }
+    }
+
+    /// @dev Sums the stake of every carriage whose ticket id falls within [firstId, secondId],
+    /// including withdrawn residual ghosts that still sit between the two ends.
+    function _getTicketRangeStake(
+        uint256 firstId,
+        uint256 secondId
+    ) internal view returns (uint256 amount) {
+        uint256 left = firstId < secondId ? firstId : secondId;
+        uint256 right = firstId < secondId ? secondId : firstId;
+        uint256 len = activeTicketIds.length;
+
+        for (uint256 i = 0; i < len; i++) {
+            uint256 ticketId = activeTicketIds[i];
+            if (ticketId >= left && ticketId <= right) {
+                amount += tickets[ticketId].stakeAmount;
+            }
+        }
+    }
+
+    function _getOccupiedStakePool() internal view returns (uint256 amount) {
         uint256 len = activeTicketIds.length;
         for (uint256 i = 0; i < len; i++) {
-            if (activeTicketIds[i] == ticketId) {
-                if (i != len - 1) {
-                    activeTicketIds[i] = activeTicketIds[len - 1];
-                }
-                activeTicketIds.pop();
-                break;
-            }
+            amount += tickets[activeTicketIds[i]].stakeAmount;
         }
     }
 
-    function _findAnotherActiveTicketByRandom(
-        uint256 randomNumber,
-        uint256 selfTicketId
+    /// @dev Removes every carriage whose ticket id is within [left, right]. The returned slot
+    /// count excludes withdrawn ghosts — they already freed their slot on withdrawal — so the
+    /// caller decrements totalSupply only by the live (Active/Invalid) carriages removed.
+    function _removeTicketRange(
+        uint256 left,
+        uint256 right
+    ) internal returns (uint256 removedAmount, uint256 removedSlotCount) {
+        uint256 writeIndex;
+        uint256 len = activeTicketIds.length;
+
+        for (uint256 readIndex = 0; readIndex < len; readIndex++) {
+            uint256 ticketId = activeTicketIds[readIndex];
+            Ticket storage t = tickets[ticketId];
+            bool inRange = ticketId >= left && ticketId <= right;
+
+            if (
+                inRange &&
+                (t.status == TicketStatus.Active ||
+                    t.status == TicketStatus.Withdrawn ||
+                    t.status == TicketStatus.Invalid)
+            ) {
+                removedAmount += t.stakeAmount;
+                if (t.status != TicketStatus.Withdrawn) removedSlotCount += 1;
+                _clearNumberIndex(ticketId, t.randomNumber);
+                t.stakeAmount = 0;
+                t.status = TicketStatus.Removed;
+                _burn(ticketId);
+            } else {
+                activeTicketIds[writeIndex] = ticketId;
+                writeIndex += 1;
+            }
+        }
+
+        while (activeTicketIds.length > writeIndex) {
+            activeTicketIds.pop();
+        }
+    }
+
+    /// @dev O(1) lookup of the lone Active ticket holding `randomNumber` (0 = none).
+    function _findAnyActiveTicketByRandom(
+        uint256 randomNumber
     ) internal view returns (uint256) {
-        uint256[] storage list = randomToTicketIds[randomNumber];
-        for (uint256 i = 0; i < list.length; i++) {
-            uint256 candidateId = list[i];
-            if (candidateId != selfTicketId && tickets[candidateId].status == TicketStatus.Active) {
-                return candidateId;
-            }
-        }
-        return 0;
+        return activeTicketIdByNumber[randomNumber];
     }
 
-    function _findAnyActiveTicketByRandom(uint256 randomNumber) internal view returns (uint256) {
-        uint256[] storage list = randomToTicketIds[randomNumber];
-        for (uint256 i = 0; i < list.length; i++) {
-            uint256 candidateId = list[i];
-            if (tickets[candidateId].status == TicketStatus.Active) {
-                return candidateId;
-            }
+    /// @dev Release a number's index slot when its ticket stops being Active (only if it is the
+    /// registered holder — the second end of a hit is never registered, so this is a safe no-op there).
+    function _clearNumberIndex(uint256 ticketId, uint256 randomNumber) internal {
+        if (activeTicketIdByNumber[randomNumber] == ticketId) {
+            activeTicketIdByNumber[randomNumber] = 0;
         }
-        return 0;
     }
 
-    function _drainAllActiveStakes() internal returns (uint256 activeStakePool) {
+    function _removeAllOccupiedTickets() internal {
         uint256 len = activeTicketIds.length;
         for (uint256 i = 0; i < len; i++) {
             uint256 ticketId = activeTicketIds[i];
             Ticket storage t = tickets[ticketId];
-            if (t.status == TicketStatus.Active) {
-                activeStakePool += t.stakeAmount;
+            if (
+                t.status == TicketStatus.Active ||
+                t.status == TicketStatus.Withdrawn ||
+                t.status == TicketStatus.Invalid
+            ) {
+                _clearNumberIndex(ticketId, t.randomNumber);
                 t.stakeAmount = 0;
                 t.status = TicketStatus.Removed;
+                _burn(ticketId);
             }
         }
         delete activeTicketIds;
+        totalSupply = 0;
     }
 
     function _mint(address to, uint256 tokenId) internal {
@@ -546,38 +998,102 @@ contract TrainGame {
         emit Transfer(address(0), to, tokenId);
     }
 
-    function _generateRandom(address player, uint256 nonce) internal view returns (uint256) {
-        return
-            uint256(
-                keccak256(
-                    abi.encodePacked(
-                        block.prevrandao,
-                        blockhash(block.number - 1),
-                        block.timestamp,
-                        player,
-                        nonce,
-                        totalSupply,
-                        activeTicketIds.length
-                    )
-                )
-            );
+    function _burn(uint256 tokenId) internal {
+        address tokenOwner = _ownerOf[tokenId];
+        if (tokenOwner == address(0)) return;
+
+        delete _ownerOf[tokenId];
+        _balanceOf[tokenOwner] -= 1;
+        emit Transfer(tokenOwner, address(0), tokenId);
+    }
+
+    // ------------------------------
+    // Token helpers (no external library; tolerate non-standard bool-less ERC20s)
+    // ------------------------------
+
+    function _tokenBalance() internal view returns (uint256) {
+        (bool success, bytes memory data) = settlementToken.staticcall(
+            abi.encodeWithSelector(ERC20_BALANCE_OF_SELECTOR, address(this))
+        );
+        if (!success || data.length < 32) revert TokenTransferFailed();
+        return abi.decode(data, (uint256));
     }
 
     function _safeTokenTransfer(address to, uint256 amount) internal {
-        (bool success, bytes memory data) = address(settlementToken).call(
-            abi.encodeCall(IERC20.transfer, (to, amount))
+        _safeTransferToken(settlementToken, to, amount);
+    }
+
+    function _safeTokenTransferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) internal {
+        (bool success, bytes memory data) = settlementToken.call(
+            abi.encodeWithSelector(
+                ERC20_TRANSFER_FROM_SELECTOR,
+                from,
+                to,
+                amount
+            )
         );
         if (!success || (data.length != 0 && !abi.decode(data, (bool)))) {
             revert TokenTransferFailed();
         }
     }
 
-    function _safeTokenTransferFrom(address from, address to, uint256 amount) internal {
-        (bool success, bytes memory data) = address(settlementToken).call(
-            abi.encodeCall(IERC20.transferFrom, (from, to, amount))
+    function _safeTransferToken(
+        address token,
+        address to,
+        uint256 amount
+    ) internal {
+        (bool success, bytes memory data) = token.call(
+            abi.encodeWithSelector(ERC20_TRANSFER_SELECTOR, to, amount)
         );
         if (!success || (data.length != 0 && !abi.decode(data, (bool)))) {
             revert TokenTransferFailed();
         }
+    }
+
+    // ------------------------------
+    // Owner fund recovery (cannot touch funds owed to players)
+    // ------------------------------
+
+    /// @notice Sweep settlement tokens that are NOT owed to anyone — fee-on-transfer dust, accidental
+    /// transfers, and forfeited ghost residuals left after the round ends. Only callable once the
+    /// round is fully settled (closed, no lock, no pending request), and it never removes the stake
+    /// still reclaimable by active holders or the unclaimed pendingRewards.
+    function sweepSettlementExcess(address to) external onlyOwner nonReentrant {
+        if (to == address(0)) revert InvalidConfig();
+        if (!closed || hitLock.active || pendingRequestId != 0) revert Locked();
+
+        uint256 owed = totalPendingRewards;
+        uint256 len = activeTicketIds.length;
+        for (uint256 i = 0; i < len; i++) {
+            Ticket storage t = tickets[activeTicketIds[i]];
+            if (t.status == TicketStatus.Active) owed += t.stakeAmount;
+        }
+
+        uint256 balance = _tokenBalance();
+        uint256 excess = balance > owed ? balance - owed : 0;
+        if (excess == 0) revert NothingToClaim();
+
+        _safeTokenTransfer(to, excess);
+        emit TokensSwept(settlementToken, to, excess);
+    }
+
+    /// @notice Recover any non-settlement token mistakenly sent to this contract.
+    function sweepOtherToken(address token, address to) external onlyOwner nonReentrant {
+        if (token == settlementToken) revert InvalidToken();
+        if (to == address(0)) revert InvalidConfig();
+
+        (bool success, bytes memory data) = token.staticcall(
+            abi.encodeWithSelector(ERC20_BALANCE_OF_SELECTOR, address(this))
+        );
+        if (!success || data.length < 32) revert TokenTransferFailed();
+        uint256 balance = abi.decode(data, (uint256));
+        if (balance == 0) revert NothingToClaim();
+
+        _safeTransferToken(token, to, balance);
+        emit TokensSwept(token, to, balance);
     }
 }
